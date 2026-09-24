@@ -194,7 +194,9 @@ export function apply(ctx: Context, config: Config): void {
   // ctx.on('system-prompt/assemble', async (_assembly: unknown, context: any, next: () => Promise<any>) => {
   //   const assembled = await next()
   //   const agent = context.agent
-  //   if (!agent || agent.session.events.some((e: any) => e.type === 'tool/call')) return assembled
+  //   // DSH >= 0.1.2: Session.events → snapshotEvents()（双兼容读取；rc.8 回退 legacy 数组）
+  //   const evts = agent?.session?.snapshotEvents ? agent.session.snapshotEvents() : (agent?.session?.events || [])
+  //   if (!agent || evts.some((e: any) => e.type === 'tool/call')) return assembled
   //   const MINE = new Set(['${pkgName.replace(/[^a-z0-9_]/gi, '_')}_hello'])
   //   const CORE = '<核心工具>'
   //   return { ...assembled, tools: assembled.tools.filter((t: any) => !MINE.has(t.name) || t.name === CORE) }

@@ -145,9 +145,16 @@ export function classifyTask(text) {
   return 'weak'
 }
 
+/** DSH >= 0.1.2 用按需读取 API（snapshotEvents()/eventAt()）取代了 `Session.events`。
+ *  双兼容读取：优先新 API，rc.8 旧版回退到 legacy 数组。 */
+export function readEvents(session) {
+  if (session && typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return (session && session.events) || []
+}
+
 /** Per-session mode derived from durable events (resume-safe). */
 export function sessionMode(session) {
-  const events = session.events
+  const events = readEvents(session)
   const userMsg = events.find((e) => e.type === 'user/message')
   return classifyTask(extractText(userMsg?.data))
 }

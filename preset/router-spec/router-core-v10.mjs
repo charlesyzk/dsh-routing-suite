@@ -157,8 +157,13 @@ export function classifyTask(text) {
  * sessions). Falls back to the first user/message of any origin when no
  * user-origin message exists.
  */
+export function readEvents(session) {
+  if (session && typeof session.snapshotEvents === 'function') return session.snapshotEvents()
+  return (session && session.events) || []
+}
+
 export function sessionMode(session) {
-  const events = session.events
+  const events = readEvents(session)
   const userMsg = events.find((e) => e.type === 'user/message' && (e.data?.source?.kind === 'user' || e.data?.source?.kind === undefined))
     ?? events.find((e) => e.type === 'user/message')
   return classifyTask(extractText(userMsg?.data))

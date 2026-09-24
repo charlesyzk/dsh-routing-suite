@@ -15,7 +15,7 @@
  */
 
 import {
-  bandFor, sessionMode, extractText, isComplexTask,
+  bandFor, sessionMode, extractText, isComplexTask, readEvents,
 } from './router-core-v34.mjs'
 import { join, dirname } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
@@ -183,7 +183,7 @@ export function muteAwareList(names, muted) {
 /** 会话是否为新会话（DSH request/header reason=initial）——即使 session id 复用了旧阶段记录，也自动从 0 开始。 */
 export function sessionFresh(agent) {
   try {
-    for (const e of agent?.session?.events || []) {
+    for (const e of readEvents(agent?.session)) {
       if (e.type === 'request/header' && e.data?.reason === 'initial') return true
     }
   } catch { /* 无法判定时按旧会话处理 */ }
@@ -194,7 +194,7 @@ export function sessionFresh(agent) {
  *  检测会话用户消息中的记忆禁用意图；命中后阶段指引不再提 recall/verify/engram。 */
 export function memoryMuted(session) {
   try {
-    const events = session?.events || []
+    const events = readEvents(session)
     const re = /不用记忆|勿用记忆|禁用记忆|记忆系统.*(不用|不要|禁用)|不要用记忆|no memory|without memory/i
     for (const e of events) {
       if (e.type !== 'user/message') continue
@@ -207,7 +207,7 @@ export function memoryMuted(session) {
 /** 会话任务回显（v1.19.1 引导工程）：取第一条真实用户消息，让模型每轮都看清"我在为哪件事工作"。 */
 export function firstUserTask(session) {
   try {
-    for (const e of session?.events || []) {
+    for (const e of readEvents(session)) {
       if (e.type !== 'user/message') continue
       const src = e.data?.source ?? e.data?.message?.source
       if (src?.kind !== 'user') continue
@@ -542,7 +542,7 @@ function loadStageState() {
       const out = {}
       for (const [sid, st] of Object.entries(parsed.sessions)) {
         const stage = Number(st?.stage)
-        if (Number.isInteger(stage) && stage >= 0 && stage <= 3) out[sid] = { stage, guided: st?.guided === true, ...(Number.isFinite(st?.stageAtTime) ? { stageAtTime: st.stageAtTime } : {}), ...(st?.lastAdvance && typeof st.lastAdvance === 'object' ? { lastAdvance: { at: Number.isFinite(st.lastAdvance.at) ? st.lastAdvance.at : 0, reason: st.lastAdvance.reason ?? null } } : {}) }
+        if (Number.isInteger(stage) && stage >= 0 && stage <= 3) out[sid] = { stage, guided: st?.guided === true, ...(Number.isFinite(st?.stageAtTime) ? { stageAtTime: st.stageAtTime } : {}), ...(Number.isInteger(st?.stageAtCount) && st.stageAtCount >= 0 ? { stageAtCount: st.stageAtCount } : {}), ...(st?.lastAdvance && typeof st.lastAdvance === 'object' ? { lastAdvance: { at: Number.isFinite(st.lastAdvance.at) ? st.lastAdvance.at : 0, reason: st.lastAdvance.reason ?? null } } : {}) }
       }
       return out
     }
@@ -631,7 +631,7 @@ export function apply(ctx, config) {
       : undefined
     if (selectedModel?.model) sessionModels.set(session.id, selectedModel)
 
-    const promoted = session.events.some((event) => event.type === 'tool/call')
+    const promoted = readEvents(session).some((event) => event.type === 'tool/call')
     const planSection = (assembled.sections || []).find((s) => /plan/i.test(s.name))
     const baseSections = planSection
       ? [planSection, { name: 'router-persona', text: RL_PERSONA, order: 0 }]
@@ -675,8 +675,17 @@ export function apply(ctx, config) {
     const text = userMsg ? extractText(userMsg) : ''
     const sid = agent.session.id
     const st = (ensureStage()[sid] ??= { stage: 0, guided: false })
-    const stageAt = st.stageAtTime ?? 0
-    const toolCalls = (agent.session.events || []).filter((e) => (e.time === undefined || e.time >= stageAt) && (e.type === 'tool/call' || e.type === 'tool/code-dispatch')).map((e) => ({ name: e.data?.name || e.data?.toolName || '', args: toolArgs(e.data) }))
+    // v1.19.x：推进窗口按事件索引（st.stageAtCount）而非墙钟——同毫秒碰撞会让触发晋级的事件
+    // 被下一轮重复计数（>=）或新信号被漏计（>）；索引窗口确定性排除已消费事件（loadStageState
+    // 透传 stageAtCount；phase_advance/dev_reset_experience 改阶时消费到当前事件数）。
+    // 旧持久化记录只有 stageAtTime（旧版代码写入）：回退旧时间过滤；两者皆无（全新会话）才全量计数。
+    const stageEvents = readEvents(agent.session)
+    const inWindow = st.stageAtCount !== undefined
+      ? (e, i) => i >= st.stageAtCount
+      : st.stageAtTime !== undefined
+        ? (e) => e.time === undefined || e.time >= st.stageAtTime
+        : () => true
+    const toolCalls = stageEvents.filter((e, i) => inWindow(e, i) && (e.type === 'tool/call' || e.type === 'tool/code-dispatch')).map((e) => ({ name: e.data?.name || e.data?.toolName || '', args: toolArgs(e.data) }))
     // v1.17.2：被拒的锁定工具调用（如阶段 0 调 bash → unknown tool）不算行为信号——
     // 只有当前阶段真实可调（view.visible）的工具调用才触发直达推进。
     let advanceCalls = toolCalls
@@ -688,6 +697,7 @@ export function apply(ctx, config) {
     const nextStage = autoAdvance(st.stage, advanceCalls, text)
     if (nextStage > st.stage) {
       st.stage = nextStage
+      st.stageAtCount = stageEvents.length
       st.stageAtTime = Date.now()
       st.lastAdvance = { at: Date.now(), reason: 'auto:' + advanceCalls.map((c) => c.name).filter(Boolean).join(',') }
       saveStageState()
@@ -800,6 +810,7 @@ export function apply(ctx, config) {
       const state = ensureStage()
       state[sid] = state[sid] ?? { stage: 0, guided: false }
       state[sid].stage = next
+      state[sid].stageAtCount = readEvents(session).length
       state[sid].stageAtTime = Date.now()
       state[sid].lastAdvance = { at: Date.now(), reason: args?.reason ? String(args.reason) : null }
       saveStageState()
@@ -1019,6 +1030,7 @@ export function apply(ctx, config) {
         const st = (ensureStage()[sid] ??= { stage: 0, guided: false })
         if (st.stage >= STAGES.length - 1) return 'already at the last stage (' + STAGES[st.stage].name + '); full catalog is open'
         st.stage += 1
+        st.stageAtCount = readEvents(agent?.session).length
         st.stageAtTime = Date.now()
         st.lastAdvance = { at: Date.now(), reason: args?.reason ? String(args.reason) : null }
         saveStageState()
@@ -1106,7 +1118,7 @@ export function apply(ctx, config) {
       if (!theAgent) throw new Error('goal tools require a calling agent')
       const agentsSvc = ctx.get('agents')
       if (!agentsSvc || agentsSvc.get(theAgent.id) !== theAgent || theAgent.status !== 'running' || (agentsSvc.currentInitiator && agentsSvc.currentInitiator() !== theAgent)) throw new Error('goal tools require the exact live calling agent inside its active driver')
-      const evs = theAgent.session.events || []
+      const evs = readEvents(theAgent.session)
       for (let i = evs.length - 1; i >= 0; i--) {
         if (evs[i]?.type === 'turn/end') throw new Error('goal tools require an open model turn')
         if (evs[i]?.type === 'turn/start') return { agent: theAgent, events: evs.slice(i + 1) }
@@ -1165,6 +1177,7 @@ export function apply(ctx, config) {
       execute: async () => {
         const st = (ensureStage()[sid] ??= { stage: 0, guided: false })
         st.stage = 0
+        st.stageAtCount = readEvents(agent?.session).length
         st.stageAtTime = Date.now()
         saveStageState()
         applyStageRestrict(agent, 0)
